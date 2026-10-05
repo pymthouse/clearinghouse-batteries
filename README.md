@@ -375,19 +375,18 @@ An application that pays for calls through the signer knows each call by the
 `manifest_id` the signer puts in every `create_signed_ticket` event. The read
 API answers what a manifest cost and serves a resumable feed of stored events,
 so applications do not consume the Kafka topic themselves. It is read-only and
-runs on its own port under its own token:
+runs on its own port and takes a management credential allowing `cost.read`
+from `--creds-file`:
 
 ```sh
-export CLEARINGHOUSE_READ_TOKEN='a-different-long-random-token'
-
-./bin/clearinghouse serve --enable-read-api :8082
+./bin/clearinghouse serve --enable-read-api :8082 --creds-file creds.toml
 ```
 
-The read token is required, must differ from the webhook token, and is sent in
-the `Livepeer-Clearinghouse-Token` header. The bind rules match the other HTTP
-servers: no default bind, loopback unless `--unsafe-http-bind`, and a port
-distinct from the webhook and management API. Requests without a valid token
-get 401.
+Callers send the credential's secret in the `Livepeer-Clearinghouse-Token`
+header. The bind rules match the other HTTP servers: no default bind, loopback
+unless `--unsafe-http-bind`, and a port distinct from the webhook and
+management API. Requests without a valid management credential get 401, and a
+credential without `cost.read` gets 403.
 
 | Route | Returns |
 | --- | --- |
