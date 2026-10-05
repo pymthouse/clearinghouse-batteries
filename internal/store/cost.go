@@ -33,15 +33,20 @@ FROM usage_events u
 WHERE u.ingest_sequence>? ORDER BY u.ingest_sequence LIMIT ?`, after, limit)
 }
 
-// ManifestCost sums the applied events of one manifest. A manifest belongs to one payment session.
-func (s *Store) ManifestCost(ctx context.Context, manifest string) (map[string]any, error) {
-	rows, err := s.DB.QueryContext(ctx, `
+// manifestCostQuery reads one manifest's applied events. usage_manifest is a
+// partial index (manifest_id<>''), and SQLite uses a partial index only when the
+// query repeats its condition: manifest_id=? alone scans every usage event.
+const manifestCostQuery = `
 SELECT s.allocation_id,s.api_key_id,u.payment_session_id,s.app,s.orchestrator,a.pm_session_id,
  a.num_tickets,a.computed_fee_wei,a.computed_fee_usd,u.billable_seconds,a.sequence_number,a.signed_at_ms
 FROM usage_events u
  JOIN signing_authorizations a ON a.usage_event_id=u.id
  JOIN payment_sessions s ON s.id=u.payment_session_id
-WHERE u.manifest_id=? AND u.status='applied' ORDER BY u.ingest_sequence`, manifest)
+WHERE u.manifest_id=? AND u.manifest_id<>'' AND u.status='applied' ORDER BY u.ingest_sequence`
+
+// ManifestCost sums the applied events of one manifest. A manifest belongs to one payment session.
+func (s *Store) ManifestCost(ctx context.Context, manifest string) (map[string]any, error) {
+	rows, err := s.DB.QueryContext(ctx, manifestCostQuery, manifest)
 	if err != nil {
 		return nil, err
 	}
