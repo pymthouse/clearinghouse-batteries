@@ -1,58 +1,61 @@
-name: CI
+name: Go
 
 on:
-  push:
-    branches: [main]
   pull_request:
-  workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  CGO_ENABLED: "1"
-  GOFLAGS: -mod=readonly
-
 jobs:
-  check:
-    name: Test, vet, and build
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+  test:
+    runs-on: ubuntu-26.04
+    env:
+      GOTOOLCHAIN: local
+      CGO_ENABLED: "1"
+      GOFLAGS: -mod=readonly
     steps:
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-
-      - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - name: Release control tests
+        run: bash .github/scripts/test-release.sh
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          cache-dependency-path: go.sum
-
+          cache: true
       - name: Verify modules
         run: |
           go mod download
           go mod verify
           go mod tidy -diff
-
-      - name: Check formatting
+      - name: Check Go formatting
         run: |
           unformatted=$(gofmt -l .)
-          if [ -n "$unformatted" ]; then
-            printf 'Run gofmt on these files:\n%s\n' "$unformatted"
+          if [[ -n "$unformatted" ]]; then
+            echo "$unformatted"
+            echo 'Run go fmt ./... to fix formatting.' >&2
             exit 1
           fi
-
+      - name: Race tests
+        run: |
+          mkdir -p "${{ runner.temp }}/clearinghouse-test-artifacts"
+          go test -race -artifacts -outputdir=${{ runner.temp }}/clearinghouse-test-artifacts ./...
+      - name: Save test artifacts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-artifacts
+          overwrite: true
+          path: ${{ runner.temp }}/clearinghouse-test-artifacts
+          if-no-files-found: ignore
       - name: Vet
-        run: make vet
-
-      - name: Test with race detector
-        run: make test
-
-      - name: Build
-        run: make build
+        run: go vet ./...
+      - name: Staticcheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@v0.8.2
+          staticcheck ./...
+      - name: Vulnerability scan
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+          govulncheck ./...

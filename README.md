@@ -10,12 +10,10 @@ Grants provide usage credits. Allocations define budgets within a grant, and
 each allocation can have multiple API keys. Payers (Livepeer gateways or remote
 signers) use these keys to authorize network payments.
 
-The clearinghouse authorization webhook checks the API key and the allocation's
-available balance. Payers log issued tickets to Kafka, and the accounting service
-validates those events and charges the allocation for usage.
-
-Authorization does not reserve funds. Delayed accounting can take an allocation
-negative before signing stops. Monitor accounting lag and quarantined events.
+The authorization webhook checks the API key, available balance, and
+[Kafka lag](#configure-kafka-lag). Payers log issued tickets to Kafka, and
+accounting validates them and charges the allocation. Authorization does not
+reserve funds, so delayed accounting can still overdraw an allocation.
 
 The optional on-chain listener records payments and escrow (deposit + reserve)
 activity. It matches settlements to sessions but does not charge for usage again.
@@ -58,6 +56,7 @@ Remove the `operator` entry if you do not need the management API, then start:
   --creds-file /run/secrets/clearinghouse-creds.toml \
   --enable-auth-webhook :8080 \
   --enable-kafka \
+  --kafka-advertised-addr clearinghouse.example.com:9093 \
   --enable-accounting
 ```
 
@@ -133,6 +132,19 @@ Set `--kafka-topic` to match the signer. External accounting uses plaintext TCP;
 configure the broker's users and permissions separately. If go-livepeer shares
 this broker, provide TLS for its producer and a private plaintext connection
 for accounting, both using the same cluster and topic.
+
+### Configure Kafka lag
+
+The webhook denies authorization when accounting lag in any partition reaches
+the limit or cannot be determined, including at startup. It resumes when lag is
+within the limit and the other authorization checks pass. Idle, caught-up topics
+remain healthy; a backlog can remain when authorization resumes.
+
+Set `--max-kafka-lag` (default `60s`, minimum `1s`),
+`CLEARINGHOUSE_MAX_KAFKA_LAG`, or `MaxKafkaLag` in TOML. Separate accounting and
+webhook processes must use the same database, Kafka topic, and limit. Lag checks
+run even when metrics are disabled. They cover only events that reach Kafka;
+monitor signer outbox delivery and quarantined events separately.
 
 ### Enable on-chain reporting
 
@@ -246,6 +258,10 @@ Start with [`config.example.toml`](config.example.toml) or
 [`config.example.json`](config.example.json). Set the credentials file path with
 `--creds-file`, `CLEARINGHOUSE_CREDS_FILE`, or `CredsFile`.
 
+For embedded Kafka behind a proxy such as TLS, set `--kafka-advertised-addr`,
+`CLEARINGHOUSE_KAFKA_ADVERTISED_ADDR`, or `KafkaAdvertisedAddr` to the client-facing
+`host:port`; when empty, it defaults to `KafkaBind`.
+
 Supply the RPC URL via `CLEARINGHOUSE_RPC_URL`, or a file selected by
 `--rpc-url-file`, `CLEARINGHOUSE_RPC_URL_FILE`, or `RPCURLFile`. Direct RPC URL
 flags and configuration values are rejected. The URL file is read verbatim;
@@ -269,16 +285,15 @@ by `--db-path`.
 Amounts use `--amount-usd` or `--amount-eth` (`amount_usd` / `amount_eth` in the
 API): exact decimals with up to 18 fractional digits. New grants default to
 USD $0 if the amount is omitted. Allocations inherit their grant's currency.
-Allocation creation and funding accept `all`. JSON amounts are decimal `*_usd`
-or `*_eth` strings.
+Allocation creation and funding accept `all`. Signer events require an ETH fee;
+USD allocations also require a USD fee. Missing required fees or invalid supplied
+fees are quarantined. On-chain escrow and settlements remain in ETH.
 
-Allocation API and CLI reads include `available_usd`/`spent_usd` (or `_eth`
-equivalents), defaulting to `"0"` if empty. Available is the remaining balance
-and may be negative; spent totals recorded usage, including late charges after
-revocation.
-
-Signer events missing USD or ETH amounts are quarantined. On-chain escrow and
-settlements remain in ETH.
+API and CLI reports use decimal `*_usd` or `*_eth` strings for numeric amounts.
+Allocation reads include `available_*` for the remaining balance, which may be
+negative, and `spent_*` for recorded usage, including late charges after revocation.
+Empty amounts return `""`, null amounts return `null`, and failed amount conversions
+return `"[error]"`. Query the database directly to inspect the stored values.
 
 Grants default to `draft`. Allocations default to `active`, or `exhausted` with
 zero funding. Exhaustion is automatic; funding reactivates exhausted allocations
@@ -292,7 +307,9 @@ unused funds, use `allocation revoke` or `POST /v1/allocations/{id}/revoke`
 ### Database management
 
 `serve` applies pending migrations. Before running CLI management or reports on
-a new database or after upgrading, run `migrate up`. `migrate down` can destroy
+a new database or after upgrading, run `migrate up`. Stop all services and
+management commands writing to a shared database before an upgrade, and restart
+all writers with the same release after migrating. `migrate down` can destroy
 accounting data; use it only on disposable databases or after a verified backup.
 
 For backups, use Litestream or stop all clearinghouse processes and management
@@ -301,144 +318,31 @@ as one consistent set. Test restoration regularly.
 
 ### HTTP listeners
 
-Both HTTP listeners require an explicit port: `:8080` binds to `127.0.0.1:8080`.
-Use IPv4 or bracketed IPv6 literals. Non-loopback and wildcard binds require
-`--unsafe-http-bind`, which adds no TLS or access control. The webhook and
-management API must use different ports; expose them through TLS proxies.
+HTTP listeners require an explicit port: `:8080` binds to `127.0.0.1:8080`.
+Use IPv4 or bracketed IPv6 literals. Non-loopback and wildcard binds require an
+`unsafe@` prefix on each address, such as `--enable-auth-webhook unsafe@0.0.0.0:8080`.
+This adds no TLS or access control. The webhook, management API, and metrics
+listeners must use different ports; for external access, expose them through TLS
+proxies.
 
-The webhook provides `POST /v1/signer/authorize` and requires a webhook credential.
-Both listeners provide unauthenticated health routes:
-
-- `GET /livez` — 200 while the server can answer.
-- `GET /readyz` — 503 during shutdown or database failure; otherwise 200.
-
-### Management HTTP API
-
-```sh
-./bin/clearinghouse serve \
-  --creds-file /run/secrets/clearinghouse-creds.toml \
-  --enable-management-api :8081
-```
-
-Resource routes require management credentials. The examples use a TLS proxy at
-`https://management.clearinghouse.example.com`, forwarding to `127.0.0.1:8081`.
-
-| Resources | Routes |
-| --- | --- |
-| Grants | `GET, POST /v1/grants`; `GET /v1/grants/{id}`; `POST /v1/grants/{id}/fund`; `PATCH /v1/grants/{id}/status` |
-| Allocations | `GET, POST /v1/allocations`; `GET /v1/allocations/{id}`; `POST /v1/allocations/{id}/fund`; `PATCH /v1/allocations/{id}/status`; `POST /v1/allocations/{id}/revoke` |
-| API keys | `GET, POST /v1/api-keys`; `GET /v1/api-keys/{id}`; `POST /v1/api-keys/{id}/revoke` |
-| Sessions | `GET /v1/sessions`; `GET /v1/sessions/{id}`; `POST /v1/sessions/{id}/revoke` |
-| Reports | `GET /v1/settlements`, `/v1/usage`, `/v1/ledger/report`, `/v1/escrow/report`, `/v1/escrow/activity` |
-
-Bodies accept JSON, `multipart/form-data`, or `application/x-www-form-urlencoded`,
-with snake_case fields and decimal strings for amounts:
-
-```sh
-curl -H 'Livepeer-Clearinghouse-Token: OPERATOR_SECRET' \
-  -F name='Developer grants' -F amount_usd=100 -F status=active \
-  https://management.clearinghouse.example.com/v1/grants
-
-curl -H 'Livepeer-Clearinghouse-Token: OPERATOR_SECRET' \
-  -H 'Content-Type: application/json' \
-  -H 'Idempotency-Key: REQUEST_KEY' \
-  -d '{"grant_id":"GRANT_ID","name":"gateway","amount_usd":"25"}' \
-  https://management.clearinghouse.example.com/v1/api-keys
-```
-
-Responses use the CLI's JSON fields and types, including decimal amount strings,
-millisecond timestamps, and string `metadata`. Item routes return one object;
-lists return paged objects with `items` and `next_cursor`. Ledger and escrow
-reports return arrays. New API-key secrets are returned on creation and matching
-idempotent retries. Migrations are CLI-only.
-
-```sh
-curl -H 'Livepeer-Clearinghouse-Token: OPERATOR_SECRET' \
-  'https://management.clearinghouse.example.com/v1/allocations?grant_id=GRANT_ID&limit=100'
-
-curl -H 'Livepeer-Clearinghouse-Token: OPERATOR_SECRET' \
-  'https://management.clearinghouse.example.com/v1/sessions?grant_id=GRANT_ID&allocation_id=ALLOCATION_ID'
-
-curl -H 'Livepeer-Clearinghouse-Token: OPERATOR_SECRET' \
-  'https://management.clearinghouse.example.com/v1/usage?allocation_id=ALLOCATION_ID&manifest_id=MANIFEST_ID'
-```
-
-List endpoints accept `limit` (default 100, minimum 1, maximum 1,000) and an
-opaque `cursor`. Results are returned in insertion order, regardless of
-timestamps or IDs. Internal sequence numbers are excluded from item JSON. A
-response has this shape:
-
-```json
-{"items": [], "next_cursor": ""}
-```
-
-When `next_cursor` is nonempty, pass it as `cursor` to fetch the next page:
-
-```sh
-curl -H 'Livepeer-Clearinghouse-Token: OPERATOR_SECRET' \
-  'https://management.clearinghouse.example.com/v1/allocations?grant_id=GRANT_ID&limit=100&cursor=NEXT_CURSOR'
-```
-
-An empty `next_cursor` means there are no more items. Pagination reads live data,
-so later inserts may appear in subsequent pages and ownership changes may affect
-filtered results.
-
-Missing or invalid credentials, or credentials for another service, return `401`.
-Malformed queries, unknown parameters, repeated parameters and empty values
-return `400`. HEAD requests use the same list query validation as GET.
-Missing route permissions return `403`. Both use plain text. Additional funding
-permission failures return `403` with a JSON `error` string. Other errors from
-resource handlers also use JSON `error` strings:
-
-| Status | Meaning |
-| --- | --- |
-| `400` | Invalid input. |
-| `404` | Missing resource. |
-| `409` | State, balance, or idempotency conflict. |
-| `413` | Body exceeds 1 MiB. |
-| `415` | Unsupported or missing content type. |
-| `500` | Unexpected failure. |
-
-Resource list routes allow only the following query parameters:
-
-| List route | Allowed query parameters |
-| --- | --- |
-| `/v1/grants` | `limit`, `cursor` |
-| `/v1/allocations` | `grant_id`, `limit`, `cursor` |
-| `/v1/api-keys`, `/v1/sessions`, `/v1/settlements` | `grant_id`, `allocation_id`, `limit`, `cursor` |
-| `/v1/usage` | `grant_id`, `allocation_id`, `manifest_id`, `limit`, `cursor` |
-
-Filters match IDs exactly. Results must match every supplied filter. Unknown IDs
-or an allocation that does not belong to the specified grant return `200` with
-`{"items":[],"next_cursor":""}`. Usage and settlements without
-an associated session appear only in unfiltered lists.
-
-#### Idempotent API Calls
-
-Allocation and API-key creation, and grant and allocation funding, accept an
-optional `Idempotency-Key` header. Choose a new random value for each operation
-and keep it for retries. The key can be 256 characters long using the base64url
-alphabet of `A-Z`, `a-z`, `0-9`, `_`, `-`, or `=`. Keys are case-sensitive;
-invalid headers return `400`.
-
-Idempotency keys are shared across these operations and all callers within a grant.
-Different grants may reuse a key. Matching retries return the original HTTP
-status and JSON response. Reusing a key with a different operation, target, or
-body returns `409`. Matching uses decoded strings: `"1"` and `"\u0031"` match,
-but `"1"` and `"1.0"` differ. JSON field order and body format do not matter;
-adding an empty or default field counts as a change. Form values must be valid UTF-8.
-
-Successful responses survive restarts and currently do not expire. Retries after
-closure or revocation still return the original response, including any API-key
-secret, without restoring access or moving funds again. Errors are not saved.
-Retries are still validated and require the same permissions as new requests.
-Saved API-key responses contain unencrypted secrets; protect the database and
-backups as described in [SECURITY.md](SECURITY.md).
+See [API.md](API.md) for the webhook, management, and health endpoints.
 
 ## Development
 
-Builds require Go 1.27.1, CGO, and a C compiler for SQLite. `make check` runs
-race-enabled tests, `go vet`, and a production build. Tests use local fixtures
-without a live chain or production credentials.
+Builds require Go 1.27.4, CGO, and a C compiler for SQLite. `make check` runs
+race-enabled tests, `go vet`, Staticcheck, a vulnerability scan, and a production
+build. Tests use local fixtures without a live chain or production credentials.
+Run `./bin/clearinghouse --version` to inspect the version and source commit.
+
+To release, set [VERSION](VERSION) to the next `MAJOR.MINOR.PATCH`, merge it to
+`main`, and run [Release](.github/workflows/release.yml) from GitHub Actions.
+Retry failures with **Re-run failed jobs** until artifacts expire after 7d, or
+rerun all jobs.
 
 See [SECURITY.md](SECURITY.md) for deployment security.
+
+### Metrics
+
+Enable a private Prometheus endpoint with `--enable-metrics :9094`. See the
+[monitoring examples](examples/monitoring/README.md) for metric semantics,
+scraping configuration, alert guidance, and a Grafana dashboard.

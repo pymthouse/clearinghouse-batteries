@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -16,12 +15,15 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/j0sh/boa/pkg/boa"
 	"github.com/j0sh/minikafka"
 	"github.com/livepeer/clearinghouse/internal/auth"
 	"github.com/livepeer/clearinghouse/internal/chain"
 	"github.com/livepeer/clearinghouse/internal/kafka"
+	"github.com/livepeer/clearinghouse/internal/metrics"
 	"github.com/livepeer/clearinghouse/internal/serviceauth"
 	"github.com/livepeer/clearinghouse/internal/store"
+	"github.com/livepeer/clearinghouse/internal/version"
 )
 
 type Common struct {
@@ -31,40 +33,20 @@ type Common struct {
 
 func (p Common) configPath() string { return p.ConfigFile }
 
-type HTTPBind struct{ netip.AddrPort }
-
-func (b *HTTPBind) UnmarshalText(text []byte) error {
-	raw := string(text)
-	if raw == "" {
-		b.AddrPort = netip.AddrPort{}
-		return nil
-	}
-	if strings.HasPrefix(raw, ":") {
-		raw = "127.0.0.1" + raw
-	}
-	addr, err := netip.ParseAddrPort(raw)
-	if err != nil {
-		return err
-	}
-	if addr.Port() == 0 {
-		return errors.New("TCP port must be between 1 and 65535")
-	}
-	b.AddrPort = addr
-	return nil
-}
-
 type ServeParams struct {
 	Common
-	EnableAuthWebhook     HTTPBind      `optional:"true" descr:"Run signer authorization HTTP server on IP:port; :port binds to 127.0.0.1"`
-	EnableManagementAPI   HTTPBind      `optional:"true" descr:"Run management HTTP server on IP:port; :port binds to 127.0.0.1"`
-	UnsafeHTTPBind        bool          `name:"unsafe-http-bind" optional:"true" descr:"Allow HTTP servers to bind to a non-loopback IP"`
+	EnableMetrics         boa.HTTPBind  `optional:"true" descr:"Private Prometheus metrics listener; :port binds to loopback; unsafe@ prefix for non-loopback"`
+	EnableAuthWebhook     boa.HTTPBind  `optional:"true" descr:"Run signer authorization HTTP server on IP:port; :port binds to loopback; unsafe@ prefix for non-loopback"`
+	EnableManagementAPI   boa.HTTPBind  `optional:"true" descr:"Run management HTTP server on IP:port; :port binds to loopback; unsafe@ prefix for non-loopback"`
 	EnableKafka           bool          `optional:"true" descr:"Run embedded Kafka broker"`
 	EnableAccounting      bool          `optional:"true" descr:"Run accounting service"`
 	KafkaBroker           string        `optional:"true" descr:"External Kafka broker address (host:port)"`
 	EnableOnchainListener bool          `optional:"true" descr:"Run on-chain RPC listener"`
 	CredsFile             string        `name:"creds-file" optional:"true" file:"true" descr:"JSON or TOML service credential registry"`
 	KafkaBind             string        `default:"127.0.0.1:9092" descr:"Embedded broker IP:port (loopback or private)"`
+	KafkaAdvertisedAddr   string        `optional:"true" descr:"Embedded broker host:port advertised to clients; defaults to KafkaBind"`
 	KafkaTopic            string        `default:"livepeer-signing" descr:"Kafka topic for issued tickets"`
+	MaxKafkaLag           time.Duration `default:"60s" descr:"Maximum Kafka consumer processing delay before signing pauses (minimum 1s)"`
 	RPCURL                string        `name:"rpc-url" optional:"true" secret:"true" descr:"On-chain RPC URL"`
 	RPCURLFile            string        `name:"rpc-url-file" secretfor:"RPCURL" descr:"File containing the on-chain RPC URL"`
 	ChainID               string        `name:"chain-id" optional:"true" descr:"Optional assertion for the RPC chain ID"`
@@ -82,21 +64,33 @@ func (p ServeParams) chainConfig() chain.Config {
 }
 
 func (p ServeParams) Validate() error {
+	if p.EnableMetrics.IsValid() {
+		for _, b := range []boa.HTTPBind{p.EnableAuthWebhook, p.EnableManagementAPI} {
+			if b.IsValid() && b.Port() == p.EnableMetrics.Port() {
+				return errors.New("metrics requires a separate TCP port")
+			}
+		}
+	}
 	webhookEnabled := p.EnableAuthWebhook.IsValid()
 	managementEnabled := p.EnableManagementAPI.IsValid()
 	if !webhookEnabled && !managementEnabled && !p.EnableKafka && !p.EnableAccounting && !p.EnableOnchainListener {
 		return errors.New("enable at least one of --enable-auth-webhook, --enable-management-api, --enable-kafka, --enable-accounting, --enable-onchain-listener")
 	}
-	if managementEnabled {
-		if !p.EnableManagementAPI.Addr().IsLoopback() && !p.UnsafeHTTPBind {
-			return errors.New("management bind must be a loopback IP; use --unsafe-http-bind to allow a non-loopback address")
-		}
-		if webhookEnabled && p.EnableManagementAPI.Port() == p.EnableAuthWebhook.Port() {
-			return errors.New("management and auth webhook must use separate TCP ports")
-		}
+	if managementEnabled && webhookEnabled && p.EnableManagementAPI.Port() == p.EnableAuthWebhook.Port() {
+		return errors.New("management and auth webhook must use separate TCP ports")
 	}
 	if p.EnableKafka && p.KafkaBroker != "" {
 		return errors.New("--kafka-broker cannot be used with --enable-kafka")
+	}
+	if p.KafkaAdvertisedAddr != "" {
+		if !p.EnableKafka {
+			return errors.New("--kafka-advertised-addr requires --enable-kafka")
+		}
+		host, port, err := net.SplitHostPort(p.KafkaAdvertisedAddr)
+		n, portErr := strconv.ParseUint(port, 10, 16)
+		if err != nil || host == "" || portErr != nil || n == 0 {
+			return fmt.Errorf("invalid Kafka advertised address %q: expected host:port with a port between 1 and 65535", p.KafkaAdvertisedAddr)
+		}
 	}
 	if p.EnableAccounting && !p.EnableKafka && p.KafkaBroker == "" {
 		return errors.New("--kafka-broker required for accounting without embedded Kafka")
@@ -111,14 +105,9 @@ func (p ServeParams) Validate() error {
 	if (webhookEnabled || managementEnabled || p.EnableKafka) && p.CredsFile == "" {
 		return errors.New("--creds-file is required for management, webhook, or embedded Kafka")
 	}
-	if p.EnableKafka || p.EnableAccounting {
+	if p.EnableKafka || p.EnableAccounting || webhookEnabled {
 		if !regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$`).MatchString(p.KafkaTopic) {
 			return errors.New("invalid Kafka topic")
-		}
-	}
-	if webhookEnabled {
-		if !p.EnableAuthWebhook.Addr().IsLoopback() && !p.UnsafeHTTPBind {
-			return errors.New("auth webhook bind must be a loopback IP; use --unsafe-http-bind to allow a non-loopback address")
 		}
 	}
 	if p.EnableKafka {
@@ -128,12 +117,15 @@ func (p ServeParams) Validate() error {
 		}
 		n, err := strconv.Atoi(port)
 		if err != nil || n < 1 || n > 65535 {
-			return errors.New("Kafka requires a fixed TCP port between 1 and 65535")
+			return errors.New("kafka requires a fixed TCP port between 1 and 65535")
 		}
 		ip := net.ParseIP(host)
 		if ip == nil || (!ip.IsLoopback() && !ip.IsPrivate()) {
-			return errors.New("Kafka bind must be a concrete loopback or private IP (no public or wildcard bind)")
+			return errors.New("kafka bind must be a concrete loopback or private IP (no public or wildcard bind)")
 		}
+	}
+	if p.MaxKafkaLag < store.MinKafkaLag {
+		return errors.New("--max-kafka-lag must be at least 1s")
 	}
 	if p.EnableOnchainListener {
 		if p.RPCURL == "" {
@@ -182,6 +174,8 @@ func Serve(ctx context.Context, p ServeParams) error {
 			return err
 		}
 		defer db.Close()
+		db.KafkaTopic = p.KafkaTopic
+		db.MaxKafkaLag = p.MaxKafkaLag
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -205,22 +199,58 @@ func Serve(ctx context.Context, p ServeParams) error {
 		}
 		locks = append(locks, f)
 	}
+	if p.EnableAccounting {
+		// Invalidate previous-run evidence before any webhook can start.
+		if err := db.SetKafkaLag(ctx, p.KafkaTopic, store.KafkaLag{}); err != nil {
+			return err
+		}
+	}
 	var broker *minikafka.Broker
 	brokerAddr := p.KafkaBroker
 	if p.EnableKafka {
 		var err error
-		broker, err = kafka.OpenBroker(ctx, p.KafkaBind, p.KafkaTopic, filepath.Dir(p.DBPath), access)
+		broker, err = kafka.OpenBroker(ctx, p.KafkaBind, p.KafkaAdvertisedAddr, p.KafkaTopic, filepath.Dir(p.DBPath), access)
 		if err != nil {
 			return err
 		}
 		defer broker.Close()
 		brokerAddr = broker.Addr()
+		if p.EnableAccounting && p.KafkaAdvertisedAddr != "" {
+			// Metadata advertises the client endpoint, but accounting uses the
+			// embedded broker's local plaintext listener for every connection.
+			dial := kafkaDialer.DialFunc
+			kafkaDialer.DialFunc = func(ctx context.Context, network, _ string) (net.Conn, error) {
+				return dial(ctx, network, brokerAddr)
+			}
+		}
 	}
-	k := &kafka.Listener{DB: db, Broker: brokerAddr, Topic: p.KafkaTopic, Dialer: kafkaDialer}
-	c := &chain.Listener{DB: db, Config: p.chainConfig()}
-	done := make(chan error, 5)
+	var telemetry *metrics.Metrics
+	if p.EnableMetrics.IsValid() {
+		telemetry = metrics.New(version.Version, version.Commit)
+		if db != nil {
+			db.Metrics = telemetry
+		}
+	}
+	k := &kafka.Listener{DB: db, Broker: brokerAddr, Topic: p.KafkaTopic, Dialer: kafkaDialer, Metrics: telemetry}
+	c := &chain.Listener{DB: db, Config: p.chainConfig(), Metrics: telemetry}
+	done := make(chan error, 7)
 	count := 0
 	start := func(fn func(context.Context) error) { count++; go func() { done <- fn(ctx) }() }
+	if telemetry != nil {
+		ln, err := net.Listen("tcp", p.EnableMetrics.String())
+		if err != nil {
+			return err
+		}
+		defer ln.Close()
+		monitorCtx, stopMonitor := context.WithCancel(ctx)
+		defer stopMonitor()
+		monitorDone := make(chan struct{})
+		go func() { defer close(monitorDone); monitorMetrics(monitorCtx, p, db, k, c, telemetry) }()
+		defer func() { stopMonitor(); <-monitorDone }()
+		mux := http.NewServeMux()
+		mux.Handle("GET /metrics", telemetry.Handler())
+		start(func(ctx context.Context) error { return serveHTTP(ctx, ln, mux) })
+	}
 	var webhookListener, managementListener net.Listener
 	if webhookBind != "" {
 		ln, err := net.Listen("tcp", webhookBind)
@@ -240,13 +270,13 @@ func Serve(ctx context.Context, p ServeParams) error {
 	}
 	if webhookListener != nil {
 		start(func(ctx context.Context) error {
-			return serveHTTP(ctx, webhookListener, authWebhookHandler(ctx, db, registry))
+			return serveHTTP(ctx, webhookListener, telemetry.HTTP("webhook", authWebhookHandler(ctx, db, registry)))
 		})
 		slog.Info("auth webhook listening", "bind", webhookListener.Addr().String())
 	}
 	if managementListener != nil {
 		start(func(ctx context.Context) error {
-			return serveHTTP(ctx, managementListener, managementHandler(ctx, db, registry))
+			return serveHTTP(ctx, managementListener, telemetry.HTTP("management", managementHandler(ctx, db, registry)))
 		})
 		slog.Info("management API listening", "bind", managementListener.Addr().String())
 	}
@@ -256,6 +286,7 @@ func Serve(ctx context.Context, p ServeParams) error {
 	}
 	if p.EnableAccounting {
 		start(k.Run)
+		start(func(ctx context.Context) error { return k.MonitorLag(ctx, p.MaxKafkaLag) })
 	}
 	if p.EnableOnchainListener {
 		start(c.Run)

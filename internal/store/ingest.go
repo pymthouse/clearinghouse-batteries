@@ -13,7 +13,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/livepeer/clearinghouse/internal/metrics"
 	"github.com/livepeer/clearinghouse/internal/units"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 type Envelope struct {
@@ -53,6 +55,10 @@ func (s *Store) Ingest(ctx context.Context, topic string, partition int, offset 
 	if offset < 0 || offset == math.MaxInt64 {
 		return errors.New("invalid Kafka offset")
 	}
+	start := time.Now()
+	var charge *big.Int
+	var applied SignedTicketEvent
+	var chargedCurrency string
 	var outcome, detail, overdraw, overdrawCurrency string
 	stream := KafkaStream(topic, partition)
 	err := s.Write(ctx, func(tx *sql.Tx) error {
@@ -65,7 +71,7 @@ func (s *Store) Ingest(ctx context.Context, topic string, partition int, offset 
 			return nil
 		}
 		if offset > next {
-			return fmt.Errorf("Kafka offset gap for %s partition %d: expected %d, received %d", topic, partition, next, offset)
+			return fmt.Errorf("kafka offset gap for %s partition %d: expected %d, received %d", topic, partition, next, offset)
 		}
 		uid, now := ID(), time.Now().UnixMilli()
 		status, reason := "applied", ""
@@ -136,7 +142,13 @@ func (s *Store) Ingest(ctx context.Context, topic string, partition int, offset 
 			return err
 		}
 		outcome, detail = status, reason
+		if status == "quarantined" {
+			if err := changeMetricCount(ctx, tx, "quarantines", QuarantineReason(reason), "", 1); err != nil {
+				return err
+			}
+		}
 		if status == "applied" {
+			applied, chargedCurrency = ev, currency
 			aid := ID()
 			if _, err := tx.ExecContext(ctx, `INSERT INTO signing_authorizations VALUES (?,?,?,?,?,?,?,?,?,?,'signed',?)`, aid, uid, ev.AuthID, ev.RequestID, fmt.Sprint(ev.Sequence), ev.PMSessionID, ev.Orchestrator, ev.ComputedFee, feeUSD, ev.NumTickets, ev.Ended); err != nil {
 				return err
@@ -145,6 +157,7 @@ func (s *Store) Ingest(ctx context.Context, topic string, partition int, offset 
 			if currency == "usd" {
 				n = usdUnits
 			}
+			charge = n
 			if err := TransferCurrency(ctx, tx, "usage:"+env.ID, "signed usage", "signing_authorization", aid, "allocation_available", allocation, "allocation_spent", allocation, currency, n); err != nil {
 				return err
 			}
@@ -156,8 +169,18 @@ func (s *Store) Ingest(ctx context.Context, topic string, partition int, offset 
 				if balance.Sign() < 0 {
 					overdraw, overdrawCurrency = balance.String(), currency
 				}
-				if _, err := tx.ExecContext(ctx, `UPDATE grant_allocations SET status='exhausted' WHERE id=? AND status='active'`, allocation); err != nil {
+				r, err := tx.ExecContext(ctx, `UPDATE grant_allocations SET status='exhausted' WHERE id=? AND status='active'`, allocation)
+				if err != nil {
 					return err
+				}
+				n, err := r.RowsAffected()
+				if err != nil {
+					return err
+				}
+				if n > 0 {
+					if err := changeInventory(ctx, tx, "allocations", currency, "active", "exhausted"); err != nil {
+						return err
+					}
 				}
 			}
 			if err := rematch(ctx, tx, ev.PMSessionID, ev.Orchestrator); err != nil {
@@ -166,6 +189,22 @@ func (s *Store) Ingest(ctx context.Context, topic string, partition int, offset 
 		}
 		return SetCheckpoint(ctx, tx, "kafka", stream, offset+1, "")
 	})
+	s.Metrics.Observe("accounting_ingest_duration_seconds", time.Since(start).Seconds(), nil)
+	if err == nil && outcome != "" && s.Metrics != nil {
+		s.Metrics.Add("usage_events_total", 1, []string{"topic", "partition", "outcome", "reason"}, topic, fmt.Sprint(partition), outcome, QuarantineReason(detail))
+		s.Metrics.Snapshot("commit_"+stream, []prometheus.Metric{metrics.Gauge("accounting_last_commit_timestamp_seconds", float64(time.Now().UnixMilli())/1000, []string{"topic", "partition"}, topic, fmt.Sprint(partition))})
+		if outcome == "applied" {
+			s.Metrics.Add("accounting_tickets_total", float64(applied.NumTickets), nil)
+
+			s.Metrics.AddAmount("accounting_charged_"+chargedCurrency+"_total", charge)
+			delay := float64(time.Now().UnixMilli()-applied.Ended) / 1000
+			if delay >= 0 && applied.Ended > 0 {
+				s.Metrics.Observe("accounting_apply_delay_seconds", delay, nil)
+			} else {
+				s.Metrics.Add("accounting_invalid_event_timestamps_total", 1, nil)
+			}
+		}
+	}
 	if err == nil {
 		if outcome == "quarantined" {
 			slog.Warn("usage quarantined", "topic", topic, "partition", partition, "offset", offset, "reason", detail)
@@ -220,6 +259,75 @@ func rematch(ctx context.Context, tx *sql.Tx, pm, orch string) error {
 	} else if len(ids) > 1 {
 		status = "ambiguous"
 	}
-	_, err = tx.ExecContext(ctx, `UPDATE settlements SET payment_session_id=?,match_status=? WHERE pm_session_id=? AND recipient=?`, id, status, pm, orch)
+	// Stable attribution must not rewrite historical settlements or their counts.
+	const changed = `pm_session_id=? AND recipient=? AND (match_status<>? OR payment_session_id IS NOT ?)`
+	rows, err = tx.QueryContext(ctx, `SELECT status,match_status,count(*) FROM settlements WHERE `+changed+` GROUP BY status,match_status`, pm, orch, status, id)
+	if err != nil {
+		return err
+	}
+	type bucket struct {
+		state, match string
+		count        int64
+	}
+	var buckets []bucket
+	for rows.Next() {
+		var b bucket
+		if err := rows.Scan(&b.state, &b.match, &b.count); err != nil {
+			rows.Close()
+			return err
+		}
+		buckets = append(buckets, b)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	if len(buckets) == 0 {
+		return nil
+	}
+	for _, b := range buckets {
+		if b.match == status {
+			continue
+		}
+		if err := changeMetricCount(ctx, tx, "settlements", b.state, b.match, -b.count); err != nil {
+			return err
+		}
+		if err := changeMetricCount(ctx, tx, "settlements", b.state, status, b.count); err != nil {
+			return err
+		}
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE settlements SET payment_session_id=?,match_status=? WHERE `+changed, id, status, pm, orch, status, id)
 	return err
+}
+
+func QuarantineReason(detail string) string {
+	switch detail {
+	case "":
+		return "none"
+	case "malformed envelope or missing event id/type/data":
+		return "envelope"
+	case "event id reused with different payload":
+		return "conflicting_id"
+	case "malformed signed-ticket data":
+		return "ticket_data"
+	case "missing auth_id or unknown payment session":
+		return "unknown_session"
+	case "event does not match session binding":
+		return "session_binding"
+	case "invalid fee, ticket count, request, timestamp, or PM session":
+		return "invalid_ticket"
+	case "USD fee unavailable":
+		return "missing_usd_fee"
+	default:
+		return "other"
+	}
+}
+func MetricAmount(value string) float64 {
+	n, ok := new(big.Int).SetString(value, 10)
+	if !ok {
+		return 0
+	}
+	f, _ := new(big.Rat).SetFrac(n, new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)).Float64()
+	return f
 }

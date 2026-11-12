@@ -45,7 +45,11 @@ func NewCurrency(t *testing.T, amount, currency string) *Fixture {
 	require.NoError(t, err)
 	f.KeyID, f.Key, err = f.DB.CreateKey(ctx, f.Allocation, "test key")
 	require.NoError(t, err)
-	f.Request = store.AuthRequest{Headers: http.Header{"Authorization": []string{"Bearer " + f.Key}}, State: &store.RemoteState{StateID: "state-1", PMSessionID: PM, OrchestratorAddress: Orch, App: "test-app", Type: "live"}}
+	// Unit fixtures explicitly supply fresh Kafka lag data; production Open
+	// never seeds health merely because a database or allocation exists.
+	now := time.Now().UnixMilli()
+	require.NoError(t, f.DB.SetKafkaLag(ctx, f.DB.KafkaTopic, store.KafkaLag{CheckedAt: now, CoveredThrough: now, Available: true}))
+	f.Request = store.AuthRequest{Headers: http.Header{"Authorization": []string{"Bearer " + f.Key}}, State: &store.RemoteState{StateID: "state-1", PMSessionID: PM, OrchestratorAddress: Orch, App: "test-app", Type: "live", FeeWei: "1", FeeUSD: "0.000000000000000001"}}
 	d, err := f.DB.Authorize(ctx, f.Request)
 	require.NoError(t, err)
 	if d.Status != 200 {
@@ -60,7 +64,7 @@ func NewCurrency(t *testing.T, amount, currency string) *Fixture {
 func (f *Fixture) ManagementState(t *testing.T) map[string][]map[string]any {
 	t.Helper()
 	state := map[string][]map[string]any{}
-	for _, table := range []string{"grants", "grant_allocations", "api_keys", "ledger_transactions", "ledger_entries", "account_balances", "management_idempotency"} {
+	for _, table := range []string{"grants", "grant_allocations", "api_keys", "ledger_transactions", "ledger_entries", "account_balances", "management_idempotency", "metric_amounts", "metric_counts", "metric_balances"} {
 		rows, err := f.DB.Rows(t.Context(), "SELECT * FROM "+table+" ORDER BY rowid")
 		require.NoError(t, err)
 		state[table] = rows

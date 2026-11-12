@@ -14,11 +14,19 @@ import (
 	"time"
 	"uuid"
 
+	"github.com/livepeer/clearinghouse/internal/metrics"
 	"github.com/livepeer/clearinghouse/migrations"
-	_ "github.com/mattn/go-sqlite3"
+	"github.com/mattn/go-sqlite3"
 )
 
-type Store struct{ DB *sql.DB }
+type Store struct {
+	DB          *sql.DB
+	Metrics     *metrics.Metrics
+	KafkaTopic  string
+	MaxKafkaLag time.Duration
+	// Now supplies the authorization clock; nil uses time.Now.
+	Now func() time.Time
+}
 
 func Open(ctx context.Context, path string, migrate bool) (*Store, error) {
 	if path == "" {
@@ -64,11 +72,36 @@ func Open(ctx context.Context, path string, migrate bool) (*Store, error) {
 			return nil, err
 		}
 	}
-	return &Store{db}, nil
+	return &Store{DB: db, KafkaTopic: DefaultKafkaTopic, MaxKafkaLag: DefaultMaxKafkaLag}, nil
 }
 
 func (s *Store) Close() error { return s.DB.Close() }
-func (s *Store) Write(ctx context.Context, fn func(*sql.Tx) error) error {
+func (s *Store) Write(ctx context.Context, fn func(*sql.Tx) error) (result error) {
+	start := time.Now()
+	defer func() {
+		outcome := "committed"
+		if result != nil {
+			outcome = "rejected"
+			var sqliteErr sqlite3.Error
+			if errors.As(result, &sqliteErr) {
+				outcome = "database_error"
+				reason := "other"
+				switch sqliteErr.Code {
+				case sqlite3.ErrBusy, sqlite3.ErrLocked:
+					reason = "busy"
+				case sqlite3.ErrFull:
+					reason = "full"
+				case sqlite3.ErrIoErr:
+					reason = "io"
+				case sqlite3.ErrCorrupt, sqlite3.ErrNotADB:
+					reason = "corrupt"
+				}
+				s.Metrics.Error("database", "transaction", reason)
+			}
+		}
+		s.Metrics.Add("db_transactions_total", 1, []string{"outcome"}, outcome)
+		s.Metrics.Observe("db_transaction_duration_seconds", time.Since(start).Seconds(), []string{"outcome"}, outcome)
+	}()
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -160,6 +193,7 @@ func TransferCurrency(ctx context.Context, tx *sql.Tx, key, reason, refType, ref
 		if err != nil {
 			return err
 		}
+		old := new(big.Int).Set(balance)
 		if e.dir == "debit" {
 			balance.Sub(balance, n)
 		} else {
@@ -168,8 +202,71 @@ func TransferCurrency(ctx context.Context, tx *sql.Tx, key, reason, refType, ref
 		if _, err := tx.ExecContext(ctx, `INSERT INTO account_balances VALUES (?,?,?,?) ON CONFLICT(account_type,account_id,currency) DO UPDATE SET balance_units=excluded.balance_units`, e.account, e.owner, currency, balance.String()); err != nil {
 			return err
 		}
+		if err := updateBalanceMetrics(ctx, tx, e.account, e.owner, currency, old, balance); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+func updateBalanceMetrics(ctx context.Context, tx *sql.Tx, account, owner, currency string, old, next *big.Int) error {
+	delta := new(big.Int).Sub(next, old)
+	switch account {
+	case "grant_unallocated":
+		return changeMetricAmount(ctx, tx, account, currency, delta)
+	case "allocation_available", "allocation_spent":
+		var eligible bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM grant_allocations WHERE id=? AND currency=?)`, owner, currency).Scan(&eligible); err != nil {
+			return err
+		}
+		if !eligible {
+			return nil
+		}
+		if err := changeMetricAmount(ctx, tx, account, currency, delta); err != nil {
+			return err
+		}
+		if account == "allocation_spent" {
+			return nil
+		}
+		if err := changeMetricAmount(ctx, tx, "allocation_overdraw", currency, new(big.Int).Sub(overdraw(next), overdraw(old))); err != nil {
+			return err
+		}
+		if err := changeMetricCount(ctx, tx, "allocations_overdrawn", currency, "", boolCount(next.Sign() < 0)-boolCount(old.Sign() < 0)); err != nil {
+			return err
+		}
+		if next.Sign() < 0 {
+			_, err := tx.ExecContext(ctx, `INSERT INTO metric_balances VALUES (?,?,?,?,?) ON CONFLICT(account_type,source_id,currency) DO UPDATE SET balance_units=excluded.balance_units`, account, owner, currency, owner, next.String())
+			return err
+		}
+		if old.Sign() < 0 {
+			_, err := tx.ExecContext(ctx, `DELETE FROM metric_balances WHERE account_type=? AND source_id=? AND currency=?`, account, owner, currency)
+			return err
+		}
+	case "escrow_deposit", "escrow_reserve":
+		if currency != "eth" {
+			return nil
+		}
+		r, err := tx.ExecContext(ctx, `UPDATE metric_balances SET balance_units=? WHERE account_type=? AND account_id=? AND currency=?`, next.String(), account, owner, currency)
+		if err != nil {
+			return err
+		}
+		tracked, err := r.RowsAffected()
+		if err != nil || tracked == 0 {
+			return err
+		}
+		if err := changeMetricAmount(ctx, tx, account, currency, delta.Mul(delta, big.NewInt(tracked))); err != nil {
+			return err
+		}
+		return changeMetricCount(ctx, tx, "escrow_unfunded_signers", account[len("escrow_"):], "", tracked*(boolCount(next.Sign() == 0)-boolCount(old.Sign() == 0)))
+	}
+	return nil
+}
+
+func overdraw(n *big.Int) *big.Int {
+	if n.Sign() < 0 {
+		return new(big.Int).Neg(n)
+	}
+	return new(big.Int)
 }
 
 func (s *Store) Rows(ctx context.Context, query string, args ...any) ([]map[string]any, error) {

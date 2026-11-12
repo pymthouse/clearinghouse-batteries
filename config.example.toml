@@ -10,14 +10,15 @@ EnableOnchainListener = false
 
 # Required when the webhook, management API, or embedded Kafka is enabled.
 CredsFile = "/run/secrets/clearinghouse-creds.toml"
-# Non-loopback and wildcard HTTP binds additionally require UnsafeHTTPBind = true.
-# UnsafeHTTPBind = true
+# Prefix each non-loopback or wildcard HTTP bind with unsafe@,
+# e.g. "unsafe@0.0.0.0:8080".
 # Run the HTTP listeners behind a terminating TLS proxy.
 
-# Run a terminating TLS TCP proxy in front of the embedded broker.
-# Producers connect to the proxy's TLS endpoint; accounting connects locally.
+# Run a TLS proxy at KafkaAdvertisedAddr in front of the embedded broker.
+# Producers connect to the TLS endpoint; accounting connects locally.
 KafkaBind = "127.0.0.1:9092"
 KafkaTopic = "livepeer-signing"
+# KafkaAdvertisedAddr = "clearinghouse.example.com:9093"
 
 # The embedded broker accepts SASL/PLAIN and SASL/SCRAM-SHA-512 with separate read
 # and write users from the credentials file. Its connection to the proxy uses
@@ -40,3 +41,6 @@ Confirmations = 64
 PollInterval = "5s"
 BlockBatchSize = 2000
 ReorgLookback = 256
+
+# Private Prometheus listener, disabled when omitted.
+# EnableMetrics = ":9094"

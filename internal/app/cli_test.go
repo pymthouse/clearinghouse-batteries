@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -35,9 +36,9 @@ func cli(t *testing.T, args ...string) string {
 	return out.String()
 }
 
-func mustHTTPBind(t testing.TB, value string) HTTPBind {
+func mustHTTPBind(t testing.TB, value string) boa.HTTPBind {
 	t.Helper()
-	var bind HTTPBind
+	var bind boa.HTTPBind
 	require.NoError(t, bind.UnmarshalText([]byte(value)))
 	return bind
 }
@@ -191,7 +192,7 @@ func TestBoaConfigEnvironmentValidationAndHelp(t *testing.T) {
 		}
 	}
 	help := cli(t, "serve", "--help")
-	for _, want := range []string{"--enable-auth-webhook string", "--unsafe-http-bind", "CLEARINGHOUSE_UNSAFE_HTTP_BIND", "--enable-kafka", "--enable-onchain-listener", "Run on-chain RPC listener", "--ticket-broker", "--start-block", "--config-file", "Configuration file", "CLEARINGHOUSE_DB_PATH", "CLEARINGHOUSE_TICKET_BROKER", "--creds-file", "CLEARINGHOUSE_CREDS_FILE", "--rpc-url-file", "CLEARINGHOUSE_RPC_URL_FILE"} {
+	for _, want := range []string{"--enable-auth-webhook string", "unsafe@", "--enable-kafka", "--enable-onchain-listener", "Run on-chain RPC listener", "--ticket-broker", "--start-block", "--config-file", "Configuration file", "CLEARINGHOUSE_DB_PATH", "CLEARINGHOUSE_TICKET_BROKER", "--creds-file", "CLEARINGHOUSE_CREDS_FILE", "--rpc-url-file", "CLEARINGHOUSE_RPC_URL_FILE"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help missing %s", want)
 		}
@@ -212,6 +213,8 @@ func TestBoaConfigEnvironmentValidationAndHelp(t *testing.T) {
 	if strings.Contains(help, "--http-bind string") {
 		t.Fatal("removed HTTP bind option exposed")
 	}
+	require.NotContains(t, help, "--unsafe-http-bind")
+	require.NotContains(t, help, "CLEARINGHOUSE_UNSAFE_HTTP_BIND")
 	for _, line := range strings.Split(help, "\n") {
 		if strings.Contains(line, "--enable-auth-webhook") && strings.Contains(line, "default") {
 			t.Fatal("auth webhook bind has a default")
@@ -291,7 +294,7 @@ func TestOrdinaryCommandsSkipMigrationPreflightButServeRejectsDrift(t *testing.T
 	if err := Execute(context.Background(), []string{"migrate", "status"}, &out, &out); err == nil || !strings.Contains(err.Error(), "unknown migration") {
 		t.Fatal(err)
 	}
-	p := ServeParams{Common: Common{DBPath: f.Path}, EnableAuthWebhook: mustHTTPBind(t, "127.0.0.1:8080"), CredsFile: testCredsFile(t)}
+	p := ServeParams{MaxKafkaLag: time.Minute, KafkaTopic: "livepeer-signing", Common: Common{DBPath: f.Path}, EnableAuthWebhook: mustHTTPBind(t, "127.0.0.1:8080"), CredsFile: testCredsFile(t)}
 	if err := Serve(context.Background(), p); err == nil || !strings.Contains(err.Error(), "unknown migration") {
 		t.Fatal(err)
 	}
@@ -313,11 +316,18 @@ func TestAllComponentCombinations(t *testing.T) {
 	require.NoError(t, r.RegisterName("eth", startupRPC{}))
 	srv := httptest.NewServer(r)
 	defer srv.Close()
-	for mask := 1; mask < 16; mask++ {
+	for mask := 1; mask < 32; mask++ {
+		if mask&15 == 0 {
+			continue
+		}
+		enabled := mask&16 != 0
 		t.Run(fmt.Sprint(mask), func(t *testing.T) {
 			dir := t.TempDir()
 			start := int64(0)
-			p := ServeParams{Common: Common{DBPath: filepath.Join(dir, "accounts.db")}, EnableKafka: mask&2 != 0, EnableOnchainListener: mask&4 != 0, CredsFile: testCredsFile(t), KafkaBind: testutil.Port(t), KafkaTopic: "events", RPCURL: srv.URL, ChainID: "42161", TicketBroker: testutil.Contract, SignerAddresses: []string{testutil.Sender}, StartBlock: &start, Confirmations: 0, BlockBatchSize: 10, ReorgLookback: 4, PollInterval: 10 * time.Millisecond}
+			p := ServeParams{MaxKafkaLag: time.Minute, Common: Common{DBPath: filepath.Join(dir, "accounts.db")}, EnableKafka: mask&2 != 0, EnableOnchainListener: mask&4 != 0, CredsFile: testCredsFile(t), KafkaBind: testutil.Port(t), KafkaTopic: "events", RPCURL: srv.URL, ChainID: "42161", TicketBroker: testutil.Contract, SignerAddresses: []string{testutil.Sender}, StartBlock: &start, Confirmations: 0, BlockBatchSize: 10, ReorgLookback: 4, PollInterval: 10 * time.Millisecond}
+			if enabled {
+				p.EnableMetrics = mustHTTPBind(t, testutil.Port(t))
+			}
 			if mask&1 != 0 {
 				p.EnableAuthWebhook = mustHTTPBind(t, testutil.Port(t))
 			}
@@ -325,7 +335,7 @@ func TestAllComponentCombinations(t *testing.T) {
 			producerAddr := p.KafkaBind
 			if p.EnableAccounting && !p.EnableKafka {
 				p.CredsFile = testHTTPCredsFile(t)
-				broker, err := kafka.OpenBroker(context.Background(), testutil.Port(t), p.KafkaTopic, filepath.Join(dir, "external"), nil)
+				broker, err := kafka.OpenBroker(context.Background(), testutil.Port(t), "", p.KafkaTopic, filepath.Join(dir, "external"), nil)
 				require.NoError(t, err)
 				brokerCtx, stop := context.WithCancel(context.Background())
 				brokerDone := make(chan error, 1)
@@ -351,6 +361,19 @@ func TestAllComponentCombinations(t *testing.T) {
 				}
 			})
 			testutil.Eventually(t, func() bool {
+				if enabled {
+					client := http.Client{Timeout: time.Second}
+					res, err := client.Get("http://" + p.EnableMetrics.String() + "/metrics")
+					if err != nil {
+						return false
+					}
+					body, err := io.ReadAll(res.Body)
+					res.Body.Close()
+					if err != nil || res.StatusCode != 200 || !strings.Contains(string(body), "livepeer_clearinghouse_build_info") {
+						return false
+					}
+				}
+
 				if p.EnableAuthWebhook.IsValid() {
 					client := http.Client{Timeout: time.Second}
 					res, err := client.Get("http://" + p.EnableAuthWebhook.String() + "/readyz")

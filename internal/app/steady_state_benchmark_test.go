@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -146,14 +147,16 @@ func BenchmarkSteadyState(b *testing.B) {
 		b.Run("layout="+string(layout), func(b *testing.B) {
 			for _, workers := range []int{1, 8, 32} {
 				b.Run(fmt.Sprintf("workers=%d", workers), func(b *testing.B) {
-					benchmarkSteadyState(b, layout, workers)
+					for _, enabled := range []bool{false, true} {
+						b.Run(fmt.Sprintf("metrics=%t", enabled), func(b *testing.B) { benchmarkSteadyState(b, layout, workers, enabled) })
+					}
 				})
 			}
 		})
 	}
 }
 
-func benchmarkSteadyState(b *testing.B, layout benchmarkLayout, workers int) {
+func benchmarkSteadyState(b *testing.B, layout benchmarkLayout, workers int, enabled bool) {
 	b.StopTimer()
 	if b.N > int(^uint(0)>>1)/benchmarkTicketsPerBatch {
 		b.Fatal("benchmark size overflows ticket count")
@@ -185,6 +188,7 @@ func benchmarkSteadyState(b *testing.B, layout benchmarkLayout, workers int) {
 	kafkaAddr := benchmarkPort(b)
 	startBlock := int64(0)
 	params := ServeParams{
+		MaxKafkaLag:           time.Minute,
 		Common:                Common{DBPath: dbPath},
 		EnableAuthWebhook:     mustHTTPBind(b, httpAddr),
 		EnableKafka:           true,
@@ -203,9 +207,13 @@ func benchmarkSteadyState(b *testing.B, layout benchmarkLayout, workers int) {
 		BlockBatchSize:        2000,
 		ReorgLookback:         256,
 	}
+	if enabled {
+		params.EnableMetrics = mustHTTPBind(b, benchmarkPort(b))
+	}
 	serviceCtx, stopService := context.WithCancel(ctx)
 	serviceDone := make(chan error, 1)
 	go func() { serviceDone <- Serve(serviceCtx, params) }()
+
 	serviceStopped := false
 	defer func() {
 		if serviceStopped {
@@ -274,12 +282,80 @@ func benchmarkSteadyState(b *testing.B, layout benchmarkLayout, workers int) {
 	if err == nil {
 		err = waitBenchmark(warmupCtx, func() (bool, error) {
 			next, _, found, checkpointErr := observer.Checkpoint(warmupCtx, "kafka", store.KafkaStream(benchmarkTopic, 0))
-			return found && next == benchmarkWarmupEvents, checkpointErr
+			if checkpointErr != nil || !found || next != benchmarkWarmupEvents {
+				return false, checkpointErr
+			}
+			// The durable health proof can follow the commit on the next poll.
+			return authorizeBenchmarkTicket(warmupCtx, httpClient, httpAddr, credentials[0].authBody, credentials[0].session) == nil, nil
 		})
 	}
 	cancelWarmup()
 	if err != nil {
 		b.Fatal(err)
+	}
+
+	var scrapes, refreshes, delaySamples atomic.Int64
+	scrapeErrors := make(chan error, 1)
+	if enabled {
+		scrapeCtx, stopScrapes := context.WithCancel(serviceCtx)
+		scrapeDone := make(chan struct{})
+		defer func() { stopScrapes(); <-scrapeDone }()
+		go func() {
+			defer close(scrapeDone)
+			client := http.Client{Timeout: 5 * time.Second}
+			tick := time.NewTicker(100 * time.Millisecond)
+			defer tick.Stop()
+			previous := ""
+			for {
+				select {
+				case <-scrapeCtx.Done():
+					return
+				case <-tick.C:
+					req, e := http.NewRequestWithContext(scrapeCtx, "GET", "http://"+params.EnableMetrics.String()+"/metrics", nil)
+					if e != nil {
+						return
+					}
+					r, e := client.Do(req)
+					if e == nil {
+						var body []byte
+						body, e = io.ReadAll(r.Body)
+						r.Body.Close()
+						if r.StatusCode != http.StatusOK {
+							e = fmt.Errorf("metrics HTTP %d", r.StatusCode)
+						}
+						if e == nil {
+							scrapes.Add(1)
+							for _, line := range strings.Split(string(body), "\n") {
+								if strings.HasPrefix(line, "livepeer_clearinghouse_accounting_apply_delay_seconds_count ") {
+									fields := strings.Fields(line)
+									if len(fields) == 2 {
+										if n, e := strconv.ParseInt(fields[1], 10, 64); e == nil {
+											delaySamples.Store(n)
+										}
+									}
+								}
+								if strings.HasPrefix(line, "livepeer_clearinghouse_collector_last_success_timestamp_seconds{collector=\"database\"}") {
+									fields := strings.Fields(line)
+									if len(fields) == 2 {
+										if previous != "" && previous != fields[1] {
+											refreshes.Add(1)
+										}
+										previous = fields[1]
+									}
+								}
+							}
+						}
+					}
+					if e != nil && scrapeCtx.Err() == nil {
+						select {
+						case scrapeErrors <- e:
+						default:
+						}
+						return
+					}
+				}
+			}
+		}()
 	}
 
 	workCtx, cancelWork := context.WithCancel(ctx)
@@ -349,6 +425,22 @@ func benchmarkSteadyState(b *testing.B, layout benchmarkLayout, workers int) {
 		b.ReportMetric(float64(b.N)/seconds, "redemptions/s")
 	}
 	b.ReportMetric(benchmarkTicketsPerBatch, "tickets/op")
+	if enabled {
+		select {
+		case err := <-scrapeErrors:
+			b.Fatal(err)
+		default:
+		}
+		b.ReportMetric(float64(scrapes.Load()), "successful-scrapes")
+		b.ReportMetric(float64(delaySamples.Load()), "delay-observations")
+		if b.Elapsed() >= 30*time.Second && delaySamples.Load() == 0 {
+			b.Fatal("no valid accounting apply delay observations")
+		}
+		b.ReportMetric(float64(refreshes.Load()), "database-refreshes")
+		if b.Elapsed() >= 30*time.Second && refreshes.Load() == 0 {
+			b.Fatal("no populated database refresh observed during long benchmark")
+		}
+	}
 	if err := verifySteadyStateBenchmark(ctx, observer, layout, credentials, totalTickets, b.N, stream); err != nil {
 		b.Fatal(err)
 	}
@@ -376,6 +468,11 @@ func setupBenchmarkCredentials(ctx context.Context, path string, layout benchmar
 		return nil, err
 	}
 	defer db.Close()
+	// Session setup predates the live consumer; supply explicit fixture evidence.
+	now := time.Now().UnixMilli()
+	if err := db.SetKafkaLag(ctx, db.KafkaTopic, store.KafkaLag{CheckedAt: now, CoveredThrough: now, Available: true}); err != nil {
+		return nil, err
+	}
 	allocationAmount, _ := new(big.Int).SetString(benchmarkAllocationWei, 10)
 	allocationCount := int64(workers)
 	if layout == benchmarkShared {
@@ -413,7 +510,7 @@ func setupBenchmarkCredentials(ctx context.Context, path string, layout benchmar
 		state := fmt.Sprintf("benchmark-state-%d", i)
 		request := store.AuthRequest{
 			Headers: http.Header{"Authorization": []string{"Bearer " + key}},
-			State:   &store.RemoteState{StateID: state, App: "benchmark", Type: "live", OrchestratorAddress: testutil.Orch},
+			State:   &store.RemoteState{StateID: state, App: "benchmark", Type: "live", OrchestratorAddress: testutil.Orch, FeeWei: "1"},
 		}
 		decision, err := db.Authorize(ctx, request)
 		if err != nil {
@@ -434,6 +531,7 @@ func setupBenchmarkCredentials(ctx context.Context, path string, layout benchmar
 
 func prepareBenchmarkTickets(total int, credentials []benchmarkCredential) ([][]byte, error) {
 	tickets := make([][]byte, total)
+	ended := time.Now().Add(-time.Second).UnixMilli()
 	for ticket := range tickets {
 		credential := credentials[ticket%len(credentials)]
 		payload := struct {
@@ -454,8 +552,8 @@ func prepareBenchmarkTickets(total int, credentials []benchmarkCredential) ([][]
 				"computed_fee":       "1",
 				"sequence_number":    ticket,
 				"num_tickets":        1,
-				"previous_time_unix": 1800000000000 + ticket,
-				"current_time_unix":  1800000000001 + ticket,
+				"previous_time_unix": ended - 1,
+				"current_time_unix":  ended,
 				"billable_secs":      1,
 				"pixels":             0,
 			},
